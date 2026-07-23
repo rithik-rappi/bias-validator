@@ -722,7 +722,8 @@ with tab_ss:
     # ── Excel download (no table render — just build & offer the file) ────────
     import io, xlsxwriter
 
-    _extra_raw = [c for c in ['infaltable','Infaltable','inflatable','Inflatable','is_inflatable','xyz_class']
+    _extra_raw = [c for c in ['infaltable','Infaltable','inflatable','Inflatable','is_inflatable','xyz_class',
+                              'adjust_safety_stock_for_bias_error','adjust_safety_stock_for_lead_time_variance']
                   if c in seg_data.columns]
     raw_keep = [c for c in ['plan_index','storereferenceid','warehouseid',
                 'forecast','forecast_ss','quantity_sold'] + _extra_raw + comp_cols_show
