@@ -32,6 +32,19 @@ st.markdown("""
     }
     div[data-testid="stDataFrame"] table { font-size: 12px; }
     .stSelectbox label, .stMultiSelect label { font-size: 12px !important; }
+
+    /* pull dashboard content to the very top */
+    .block-container { padding-top: 1.2rem !important; }
+
+    /* make the two tab names ~2X larger and clearly visible */
+    .stTabs [data-baseweb="tab-list"] { gap: 28px; }
+    .stTabs [data-baseweb="tab"] {
+        height: auto; padding: 10px 22px;
+    }
+    .stTabs [data-baseweb="tab"] p {
+        font-size: 28px !important;
+        font-weight: 700 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,7 +62,7 @@ def load_data(file):
                 'bias%','bias_ss%','z_sl','Z_SL','rmse_component','forecast_error_component',
                 'lead_time_variance_component','bias_adjustment','forecast_error_percent_bias',
                 'uncapped_safety_stock','new_ss_raw','new_ss_capped','original_safety_stock',
-                'average_sales_14day']:
+                'average_sales_14day','BT_forecast_error_percent_bias']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     # derive excess
@@ -68,7 +81,20 @@ def load_data(file):
         df.drop(columns=['_cb_val', '_cb_ss_val'], inplace=True)
     return df
 
-uploaded = st.file_uploader("Upload plan_data parquet file", type=["parquet"])
+# ── Header: small dashboard name (top-left) + upload option beneath it ──
+head_col, _head_spacer = st.columns([1, 3])
+with head_col:
+    st.markdown(
+        '<div style="font-size:13px; font-weight:700; color:#495057;'
+        'text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px;">'
+        '📦 Forecast Bias &amp; Safety Stock Dashboard</div>',
+        unsafe_allow_html=True
+    )
+    uploaded = st.file_uploader(
+        "Upload plan_data parquet file", type=["parquet"],
+        label_visibility="collapsed"
+    )
+
 if uploaded is None:
     st.info("⬆️  Upload the parquet file to begin.")
     st.stop()
@@ -250,7 +276,6 @@ def of_analysis(df, dim):
 # ═══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("📦 Forecast Bias & Safety Stock Dashboard")
 tab_main, tab_ss = st.tabs(["📊 Forecast & Bias", "🧮 Safety Stock Decomposition"])
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -549,7 +574,7 @@ with tab_ss:
 
     comp_cols_show = [c for c in [_zsl_col,'rmse_component','forecast_error_component',
                                    'lead_time_variance_component','bias_adjustment',
-                                   'forecast_error_percent_bias','uncapped_safety_stock',
+                                   'BT_forecast_error_percent_bias','uncapped_safety_stock',
                                    'new_ss_raw','new_ss_capped','original_safety_stock']
                       if c is not None and c in ss_df.columns]
 
@@ -694,16 +719,88 @@ with tab_ss:
     with grid_r2c2:
         st.markdown(cell_html(_zsl_col or "z_sl",             zsl_avg, norm_pct.get(_zsl_col or 'z_sl', 0),           "#276749"), unsafe_allow_html=True)
 
-    # raw data expander — plan-level with all component cols
+    # ── Excel download (no table render — just build & offer the file) ────────
+    import io, xlsxwriter
+
+    _extra_raw = [c for c in ['infaltable','Infaltable','inflatable','Inflatable','is_inflatable','xyz_class']
+                  if c in seg_data.columns]
     raw_keep = [c for c in ['plan_index','storereferenceid','warehouseid',
-                'forecast','forecast_ss','quantity_sold'] + comp_cols_show if c in seg_data.columns]
-    raw_all = seg_data[raw_keep].copy()
-    with st.expander("📋 View raw plan-level data", expanded=False):
-        st.dataframe(raw_all, use_container_width=True, height=350)
-        csv = raw_all.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Download as CSV", data=csv,
-                           file_name="ss_segment_raw.csv", mime="text/csv",
-                           key="dl_ss_seg_raw")
+                'forecast','forecast_ss','quantity_sold'] + _extra_raw + comp_cols_show
+                if c in seg_data.columns]
+    raw_all = seg_data[raw_keep].reset_index(drop=True).copy()
+
+    def _build_xlsx(df):
+        _zsl_ref = _zsl_col
+        _ss_out  = ss_out_col
+        buf = io.BytesIO()
+        wb  = xlsxwriter.Workbook(buf, {'in_memory': True, 'nan_inf_to_errors': True})
+        ws  = wb.add_worksheet("raw_data")
+
+        hdr_fmt  = wb.add_format({'bold': True, 'bg_color': '#343a40',
+                                   'font_color': '#ffffff', 'border': 1,
+                                   'text_wrap': True, 'valign': 'vcenter'})
+        base_fmt = wb.add_format({'border': 1, 'valign': 'vcenter'})
+
+        def _rgb_fmt(r, g, b, bold=False):
+            return wb.add_format({'bg_color': f'#{r:02X}{g:02X}{b:02X}',
+                                  'border': 1, 'bold': bold, 'valign': 'vcenter'})
+
+        for ci, col in enumerate(df.columns):
+            ws.write(0, ci, col, hdr_fmt)
+            ws.set_column(ci, ci, max(12, len(str(col)) + 2))
+
+        # precompute gradient params — red only when value inflates SS
+        _max_ss   = df[_ss_out].max() if (_ss_out and _ss_out in df.columns) else None
+        _ba_vals  = df['bias_adjustment'] if 'bias_adjustment' in df.columns else None
+        _min_ba   = _ba_vals[_ba_vals < 1].min() if (_ba_vals is not None and (_ba_vals < 1).any()) else None
+        _range_ba = (1.0 - _min_ba) if _min_ba is not None and (1.0 - _min_ba) > 0 else 1
+        _zsl_vals = df[_zsl_ref] if (_zsl_ref and _zsl_ref in df.columns) else None
+        _max_z    = _zsl_vals[_zsl_vals > 1].max() if (_zsl_vals is not None and (_zsl_vals > 1).any()) else None
+        _range_z  = (_max_z - 1.0) if _max_z is not None and (_max_z - 1.0) > 0 else 1
+        _fe_vals  = df['forecast_error_component'] if 'forecast_error_component' in df.columns else None
+        _max_fe   = _fe_vals[_fe_vals > 1].max() if (_fe_vals is not None and (_fe_vals > 1).any()) else None
+        _range_fe = (_max_fe - 1.0) if _max_fe is not None and (_max_fe - 1.0) > 0 else 1
+        _lt_vals  = df['lead_time_variance_component'] if 'lead_time_variance_component' in df.columns else None
+        _max_lt   = _lt_vals[_lt_vals > 1].max() if (_lt_vals is not None and (_lt_vals > 1).any()) else None
+        _range_lt = (_max_lt - 1.0) if _max_lt is not None and (_max_lt - 1.0) > 0 else 1
+
+        for ri, row_data in enumerate(df.itertuples(index=False), start=1):
+            row_dict = dict(zip(df.columns, row_data))
+            for ci, col in enumerate(df.columns):
+                val = row_dict[col]
+                cell_val = None if (isinstance(val, float) and np.isnan(val)) else val
+                if col == _ss_out and _max_ss and not pd.isna(val) and val > 0:
+                    _i = max(0, min(255, int(255 - 160 * (val / _max_ss))))
+                    fmt = _rgb_fmt(255, _i, _i, bold=True)
+                elif col == 'bias_adjustment' and _min_ba is not None and not pd.isna(val) and val < 1:
+                    _i = max(0, min(255, int(255 - 160 * ((1.0 - val) / _range_ba))))
+                    fmt = _rgb_fmt(255, _i, _i, bold=True)
+                elif col == _zsl_ref and _max_z is not None and not pd.isna(val) and val > 1:
+                    _i = max(0, min(255, int(255 - 160 * ((val - 1.0) / _range_z))))
+                    fmt = _rgb_fmt(255, _i, _i, bold=True)
+                elif col == 'forecast_error_component' and _max_fe is not None and not pd.isna(val) and val > 1:
+                    _i = max(0, min(255, int(255 - 160 * ((val - 1.0) / _range_fe))))
+                    fmt = _rgb_fmt(255, _i, _i, bold=True)
+                elif col == 'lead_time_variance_component' and _max_lt is not None and not pd.isna(val) and val > 1:
+                    _i = max(0, min(255, int(255 - 160 * ((val - 1.0) / _range_lt))))
+                    fmt = _rgb_fmt(255, _i, _i, bold=True)
+                else:
+                    fmt = base_fmt
+                ws.write(ri, ci, cell_val, fmt)
+
+        ws.freeze_panes(1, 0)
+        wb.close()
+        buf.seek(0)
+        return buf.read()
+
+    xlsx_bytes = _build_xlsx(raw_all)
+    st.download_button(
+        "⬇️ Download segment data as Excel (.xlsx)",
+        data=xlsx_bytes,
+        file_name="ss_segment_raw.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_ss_seg_raw"
+    )
 
     st.markdown("---")
 
@@ -746,34 +843,12 @@ with tab_ss:
         )
         st.plotly_chart(fig_drv, use_container_width=True)
 
-        # table: colour ss_out_col red, plus highlight max driver component col per row
-        def style_driver_table(df):
-            styles = pd.DataFrame('', index=df.index, columns=df.columns)
-            # colour the SS output col always red-gradient
-            if ss_out_col in df.columns:
-                max_ss = df[ss_out_col].max()
-                for i, val in enumerate(df[ss_out_col]):
-                    if pd.isna(val) or not max_ss:
-                        intensity = 255
-                    else:
-                        intensity = max(0, min(255, int(255 - 160 * (val / max_ss))))
-                    styles.iloc[i, df.columns.get_loc(ss_out_col)] = (
-                        f'background-color: rgb(255,{intensity},{intensity}); font-weight:600')
-            # highlight the biggest input driver col per row
-            if driver_input_cols:
-                for i, row in df[driver_input_cols].iterrows():
-                    if row.notna().any():
-                        max_c = row.idxmax()
-                        styles.iloc[i, df.columns.get_loc(max_c)] = (
-                            'background-color: #ffe0e0; color: #c0392b; font-weight:600')
-            return styles
-
         fmt = {'N':'{:,}','avg_SS_pct_of_OQ':'{:.2f}%','total_SS':'{:,.2f}'}
         for c in comp_cols_show:
             fmt[c] = '{:.3f}'
 
         st.dataframe(
-            driver_agg.style.apply(style_driver_table, axis=None).format(fmt).hide(axis='index'),
+            driver_agg.style.format(fmt).hide(axis='index'),
             use_container_width=True, height=300
         )
 
@@ -784,7 +859,7 @@ with tab_ss:
 
     dist_cols = [c for c in [_zsl_col,'rmse_component','forecast_error_component',
                               'lead_time_variance_component','bias_adjustment',
-                              'forecast_error_percent_bias'] if c and c in ss_df.columns]
+                              'BT_forecast_error_percent_bias'] if c and c in ss_df.columns]
 
     if dist_cols:
         selected_dist_col = st.selectbox("Select component to inspect", dist_cols, key="dist_col")
@@ -821,8 +896,8 @@ with tab_ss:
     # ── 5. Bias Adjustment Impact ─────────────────────────────────────────────
     st.markdown("#### 5. Bias Adjustment Impact")
 
-    # let user pick which bias column to use on X axis
-    bias_x_options = [c for c in ['forecast_error_percent_bias','BT_forecast_error_percent_bias']
+    # let user pick which bias column to use on X axis — BT version preferred/default
+    bias_x_options = [c for c in ['BT_forecast_error_percent_bias','forecast_error_percent_bias']
                       if c in ss_df.columns]
 
     if 'bias_adjustment' in ss_df.columns and bias_x_options:
